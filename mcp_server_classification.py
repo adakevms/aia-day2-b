@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
+MCP Server for OmniTech Customer Support with Canonical Queries & RAG
 ─────────────────────────────────────────────────────────────────────
 Lab 4: Building a Customer Support Classification MCP Server
 
+This server provides a production-ready customer support system:
+1. CLASSIFICATION TOOLS - Determine which support category matches the query
+2. KNOWLEDGE RETRIEVAL - RAG-based search through OmniTech PDFs
+3. PROMPT TEMPLATES - Structured prompts for consistent support responses
+4. AUTOMATIC INDEXING - PDFs are indexed on server startup
 """
 
 from __future__ import annotations
@@ -23,9 +29,17 @@ from sentence_transformers import SentenceTransformer
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # Paths to OmniTech knowledge base
+KNOWLEDGE_BASE_DIR = Path("knowledge_base_pdfs")
+CHROMA_PATH = Path("./mcp_chroma_db")
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+INDEX_TOOL_PATH = Path("tools/index_pdfs.py")
 
 # Document categories for targeted search
 DOCUMENT_CATEGORIES = {
+    "account_security": ["OmniTech_Account_Security_Handbook.pdf"],
+    "device_troubleshooting": ["OmniTech_Device_Troubleshooting_Manual.pdf"],
+    "shipping_inquiry": ["OmniTech_Global_Shipping_Logistics.pdf"],
+    "returns_refunds": ["OmniTech_Returns_Policy_2024.pdf"],
 }
 
 # Caches
@@ -63,6 +77,7 @@ def _get_chroma_collection() -> chromadb.Collection:
     return _knowledge_collection
 
 def _index_knowledge_base():
+    """Index OmniTech PDFs into ChromaDB if not already indexed."""
     global _chroma_client, _knowledge_collection
 
     # Check if ChromaDB already exists with data
@@ -88,6 +103,11 @@ def _index_knowledge_base():
 
     try:
         cmd = [
+            sys.executable,
+            str(INDEX_TOOL_PATH),
+            "--pdf-dir", str(KNOWLEDGE_BASE_DIR),
+            "--chroma-path", str(CHROMA_PATH),
+            "--collection", "omnitech_knowledge"
         ]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -128,30 +148,149 @@ def _index_knowledge_base():
 
 CANONICAL_QUERIES = {
     "account_security": {
+        "description": "Account security, passwords, 2FA, and account recovery",
+        "parameters": [],
+        "prompt_template": """You are an OmniTech customer support specialist focused on account security.
+
+Based on the following documentation:
+{knowledge}
+
+Please help the customer with their security-related question: {query}
+
+Provide a clear, helpful response that:
+1. Directly addresses their security concern
+2. Includes step-by-step instructions if applicable
+3. Emphasizes security best practices
+4. Offers additional security tips when relevant
+
+Be professional, reassuring, and thorough.""",
+        "example_queries": [
+            "How do I reset my password?",
+            "Can you help me set up two-factor authentication?",
+            "What should I do if my account is compromised?",
+            "How do I change my security questions?",
+            "Is my account secure?"
+        ]
     },
 
     "device_troubleshooting": {
+        "description": "Technical issues, device problems, and troubleshooting",
+        "parameters": [],
+        "prompt_template": """You are an OmniTech technical support specialist.
+
+Based on the following troubleshooting documentation:
+{knowledge}
+
+Please help the customer with their device issue: {query}
+
+Provide a clear troubleshooting response that:
+1. Identifies the likely cause of the problem
+2. Offers step-by-step troubleshooting instructions
+3. Suggests preventive measures
+4. Indicates when professional repair might be needed
+
+Be patient, technical but accessible, and thorough.""",
+        "example_queries": [
+            "My device won't turn on",
+            "How do I perform a factory reset?",
+            "The screen is frozen",
+            "My device is overheating",
+            "The battery drains too quickly"
+        ]
     },
 
     "shipping_inquiry": {
+        "description": "Order tracking, delivery times, and shipping information",
+        "parameters": [],
+        "prompt_template": """You are an OmniTech shipping and logistics specialist.
+
+Based on the following shipping documentation:
+{knowledge}
+
+Please help the customer with their shipping question: {query}
+
+Provide helpful shipping information that:
+1. Answers their specific shipping question
+2. Provides relevant timeframes and policies
+3. Explains tracking and delivery options
+4. Mentions any special considerations
+
+Be informative, precise with timeframes, and helpful.""",
+        "example_queries": [
+            "When will my order arrive?",
+            "Do you ship internationally?",
+            "How can I track my package?",
+            "What are the shipping costs?",
+            "Can I change my delivery address?"
+        ]
     },
 
     "returns_refunds": {
+        "description": "Return policies, refunds, warranties, and exchanges",
+        "parameters": [],
+        "prompt_template": """You are an OmniTech returns and warranty specialist.
+
+Based on the following returns policy documentation:
+{knowledge}
+
+Please help the customer with their returns/warranty question: {query}
+
+Provide a clear response about returns that:
+1. Explains the relevant policy clearly
+2. States timeframes and conditions
+3. Describes the return/refund process
+4. Mentions warranty coverage if applicable
+
+Be understanding, clear about policies, and helpful.""",
+        "example_queries": [
+            "What is your return policy?",
+            "How long do I have to return a product?",
+            "Is my device still under warranty?",
+            "How do I get a refund?",
+            "Can I exchange my product?"
+        ]
     },
 
     "general_support": {
+        "description": "General customer assistance and other inquiries",
+        "parameters": [],
+        "prompt_template": """You are an OmniTech customer support representative.
+
+Based on the following documentation:
+{knowledge}
+
+Please help the customer with their question: {query}
+
+Provide a helpful, professional response that addresses their needs.
+If the query relates to a specific category (security, troubleshooting, shipping, or returns),
+focus on that area while maintaining a friendly, supportive tone.""",
+        "example_queries": [
+            "How do I contact customer support?",
+            "What are your business hours?",
+            "Tell me about OmniTech products",
+            "I need help with my account",
+            "General product information"
+        ]
+    }
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # 3. FastMCP Server and Tools                                        ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
+mcp = FastMCP("OmniTechSupportServer")
 
 # ─── Query Classification Tools ───────────────────────────────────
 
 @mcp.tool
 def list_canonical_queries() -> dict:
     """
+    List all available customer support canonical queries.
+
+    Returns
+    -------
+    dict
+        {"queries": [{"name": str, "description": str, "examples": list}]}
     """
     queries = []
     for name, config in CANONICAL_QUERIES.items():
@@ -166,15 +305,41 @@ def list_canonical_queries() -> dict:
 @mcp.tool
 def classify_canonical_query(user_query: str) -> dict:
     """
+    Classify which customer support category best matches user intent.
+
+    Parameters
+    ----------
+    user_query : str
+        Natural language query from user
+
+    Returns
+    -------
+    dict
+        {"suggested_query": str, "confidence": float, "alternatives": list}
     """
     user_lower = user_query.lower()
     scores = {}
 
     # Keyword mapping for classification
     keyword_maps = {
+        "account_security": ["password", "reset", "security", "2fa", "two-factor",
+                            "authentication", "account", "compromised", "hack", "secure",
+                            "login", "sign in", "access", "locked out"],
+        "device_troubleshooting": ["device", "won't", "turn on", "frozen", "screen",
+                                  "not working", "broken", "fix", "troubleshoot", "problem",
+                                  "issue", "error", "crash", "slow", "battery", "overheat",
+                                  "restart", "factory reset", "malfunction"],
+        "shipping_inquiry": ["ship", "shipping", "delivery", "track", "order", "arrive",
+                           "package", "international", "cost", "when will", "tracking",
+                           "expedited", "express", "standard", "eta"],
+        "returns_refunds": ["return", "refund", "warranty", "exchange", "policy",
+                          "money back", "defective", "replace", "days", "expired",
+                          "damaged", "wrong item", "dissatisfied"],
+        "general_support": ["help", "support", "contact", "hours", "information", "about",
+                          "general", "question", "inquiry", "assistance"]
     }
 
-
+    # Score each canonical query
     for query_name, keywords in keyword_maps.items():
         score = 0
         matched_keywords = []
@@ -187,6 +352,7 @@ def classify_canonical_query(user_query: str) -> dict:
         # Normalize score
         scores[query_name] = score / len(keywords) if keywords else 0
 
+    # Check against example queries for better matching
     for query_name, config in CANONICAL_QUERIES.items():
         for example in config["example_queries"]:
             example_lower = example.lower()
@@ -198,6 +364,7 @@ def classify_canonical_query(user_query: str) -> dict:
                 similarity = overlap / max(len(example_words), len(user_words))
                 scores[query_name] = max(scores.get(query_name, 0), similarity)
 
+    # Find best match
     if not scores or max(scores.values()) == 0:
         # Default to general support
         return {
@@ -210,6 +377,7 @@ def classify_canonical_query(user_query: str) -> dict:
     best_query = max(scores, key=scores.get)
     confidence = min(scores[best_query], 1.0)
 
+    # Get alternatives
     alternatives = [
         {"query": name, "score": score}
         for name, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)
@@ -226,6 +394,17 @@ def classify_canonical_query(user_query: str) -> dict:
 @mcp.tool
 def get_query_template(query_name: str) -> dict:
     """
+    Get the prompt template for a customer support canonical query.
+
+    Parameters
+    ----------
+    query_name : str
+        Name of the canonical query
+
+    Returns
+    -------
+    dict
+        {"template": str, "description": str}
     """
     if query_name not in CANONICAL_QUERIES:
         return {"error": f"Unknown canonical query: {query_name}"}
@@ -240,6 +419,7 @@ def get_query_template(query_name: str) -> dict:
 # ─── Knowledge Retrieval Tools (RAG) ─────────────────────────────
 
 def _vector_search_knowledge_internal(query: str, top_k: int = 5, category: str = None) -> dict:
+    """Internal function for vector search."""
     try:
         embed_model = _get_embed_model()
         collection = _get_chroma_collection()
@@ -251,6 +431,8 @@ def _vector_search_knowledge_internal(query: str, top_k: int = 5, category: str 
                 "error": "Knowledge base not indexed. Please run the server to index PDFs."
             }
 
+        # Encode query
+        query_embedding = embed_model.encode(query).tolist()
 
         # Prepare where clause for category filtering
         where_clause = None
@@ -258,6 +440,13 @@ def _vector_search_knowledge_internal(query: str, top_k: int = 5, category: str 
             pdf_names = DOCUMENT_CATEGORIES[category]
             where_clause = {"source": {"$in": pdf_names}}
 
+        # Search
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(top_k, collection.count()),
+            where=where_clause,
+            include=["documents", "metadatas", "distances"]
+        )
 
         matches = []
         if results["documents"] and results["documents"][0]:
@@ -284,6 +473,21 @@ def _vector_search_knowledge_internal(query: str, top_k: int = 5, category: str 
 @mcp.tool
 def vector_search_knowledge(query: str, top_k: int = 5, category: str = None) -> dict:
     """
+    Semantic search through OmniTech knowledge base using ChromaDB.
+
+    Parameters
+    ----------
+    query : str
+        Natural language search query
+    top_k : int
+        Number of results to return (default: 5)
+    category : str, optional
+        Limit search to specific category (account_security, device_troubleshooting, etc.)
+
+    Returns
+    -------
+    dict
+        {"matches": list of documents with metadata, "count": int}
     """
     return _vector_search_knowledge_internal(query, top_k, category)
 
@@ -309,6 +513,8 @@ def get_knowledge_for_query(category: str, query: str, top_k: int = 3) -> dict:
         {"knowledge": concatenated relevant text, "sources": list of sources}
     """
     try:
+        # Use vector search with category filter
+        search_result = _vector_search_knowledge_internal(query, top_k=top_k, category=category)
 
         if "error" in search_result:
             return search_result
@@ -339,6 +545,17 @@ def get_knowledge_for_query(category: str, query: str, top_k: int = 3) -> dict:
 @mcp.tool
 def validate_support_query(query: str) -> dict:
     """
+    Validate if a query is appropriate for customer support.
+
+    Parameters
+    ----------
+    query : str
+        User query to validate
+
+    Returns
+    -------
+    dict
+        {"valid": bool, "reason": str, "suggestions": list}
     """
     if not query or len(query.strip()) < 3:
         return {
@@ -347,6 +564,7 @@ def validate_support_query(query: str) -> dict:
             "suggestions": ["Please provide more details about your issue"]
         }
 
+    # Check for inappropriate content (simplified check)
     inappropriate_words = ["hack", "exploit", "illegal", "crack"]
     query_lower = query.lower()
 
@@ -449,3 +667,5 @@ if __name__ == "__main__":
 
     print("\nServer endpoint: POST http://127.0.0.1:8000/mcp/")
     print("=" * 70 + "\n")
+
+    mcp.run(transport="http", host="127.0.0.1", port=8000, path="/mcp/")

@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
+OmniTech Customer Support RAG Agent with MCP Classification
 ────────────────────────────────────────────────────────────
 
 This agent uses the MCP server for ALL knowledge access (centralized knowledge layer):
 
 CUSTOMER SUPPORT WORKFLOW (for classified queries):
+1. CLASSIFICATION: Ask MCP server to classify the support category
+2. TEMPLATE: Get the appropriate prompt template from MCP
+3. KNOWLEDGE: Retrieve relevant documentation from OmniTech PDFs via MCP
+4. EXECUTION: Run LLM locally with template + knowledge
 
 EXPLORATORY SEARCH WORKFLOW (for general questions):
+1. RAG SEARCH: Use MCP server's vector_search_knowledge for semantic search
+2. SYNTHESIS: Generate response from retrieved documentation
 
 ARCHITECTURE:
+• MCP Server = Knowledge Layer (owns vector DB, PDFs, embeddings)
+• RAG Agent = Orchestration Layer (routing, LLM execution, workflow)
+• All knowledge access goes through MCP tools (no direct file reading)
 
 KNOWLEDGE SOURCES (all accessed via MCP):
 • OmniTech_Account_Security_Handbook.pdf
@@ -42,6 +52,12 @@ RESET = "\033[0m"      # Reset to default color
 
 # Support category keywords for quick routing
 SUPPORT_KEYWORDS = {
+    "password": ["password", "reset", "forgot", "login", "access"],
+    "security": ["2fa", "two-factor", "authentication", "hacked", "compromised", "secure"],
+    "device": ["device", "won't turn", "frozen", "screen", "factory reset", "broken"],
+    "shipping": ["ship", "delivery", "track", "order", "arrive", "package"],
+    "return": ["return", "refund", "warranty", "exchange", "money back"],
+    "exploratory": ["product", "company", "omnitech", "tell me about", "what is"]
 }
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -81,6 +97,7 @@ def format_response(response: str) -> str:
         return f"{BLUE}{response}{RESET}"
 
 def is_support_query(query: str) -> bool:
+    """Determine if this is a customer support query vs exploratory."""
     query_lower = query.lower()
 
     # Check for support-related keywords
@@ -93,6 +110,14 @@ def is_support_query(query: str) -> bool:
 
     # Check for question patterns that indicate support need
     support_patterns = [
+        r"how do i",
+        r"how can i",
+        r"what should i",
+        r"can you help",
+        r"i need help",
+        r"my \w+ (is|isn't|won't)",
+        r"problem with",
+        r"issue with"
     ]
 
     for pattern in support_patterns:
@@ -105,18 +130,57 @@ def is_support_query(query: str) -> bool:
 # 2b. Dynamic MCP Tool Discovery                                     ║
 # ╚══════════════════════════════════════════════════════════════════╝
 #
-# Instead of hardcoding what tools the server offers, we ASK the
-# server what it exposes at runtime. The resulting catalog is injected
-# into the LLM's system prompt so the model sees the live tool info
-# that came from the MCP server.
-async def discover_mcp_tools(mcp):
-    """Fetch tool definitions from the running MCP server."""
+# Instead of hardcoding knowledge about which tools the server offers,
+# we ASK the MCP server what it exposes at runtime. This is the whole
+# point of MCP: the server advertises its tools (name + description +
+# input schema), and the client/agent discovers them dynamically.
+#
+# The result is turned into a short catalog string that we inject into
+# the LLM's system prompt so the model is explicitly told – from the
+# live server – which tools produced the knowledge it is seeing.
+async def discover_mcp_tools(mcp) -> tuple[list, str]:
+    """
+    Fetch tool definitions from the running MCP server.
+
+    Returns
+    -------
+    (tools, catalog_text)
+        tools        : list of tool objects as returned by mcp.list_tools()
+        catalog_text : pretty-printed catalog suitable for a system prompt
+    """
+    tools = await mcp.list_tools()
+
+    lines = ["Available MCP tools (discovered at runtime from the server):"]
+    for t in tools:
+        # Handle both FastMCP Tool objects and plain dicts
+        name = getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else str(t))
+        desc = getattr(t, "description", None) or (t.get("description") if isinstance(t, dict) else "")
+        first_line = (desc or "").strip().split("\n")[0] if desc else ""
+        lines.append(f"  - {name}: {first_line}" if first_line else f"  - {name}")
+
+    catalog_text = "\n".join(lines)
+    return tools, catalog_text
+
 
 def tool_names(tools) -> set:
     """Extract the set of tool names from a list of tool objects/dicts."""
+    names = set()
+    for t in tools:
+        name = getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else None)
+        if name:
+            names.add(name)
+    return names
 
-def require_tools(available: set, required) -> Optional[str]:
+
+def require_tools(available: set, required: list[str]) -> Optional[str]:
     """Return an error message if any required tool is missing, else None."""
+    missing = [name for name in required if name not in available]
+    if missing:
+        return (
+            f"Required MCP tool(s) not advertised by the server: {missing}. "
+            "Confirm the classification server is running and up to date."
+        )
+    return None
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # 3. Customer Support Classification Workflow                        ║
@@ -127,14 +191,31 @@ async def handle_canonical_query_with_classification(user_query: str) -> str:
     """
     async with Client(MCP_ENDPOINT) as mcp:
         try:
-            # Discover what the MCP server actually exposes – do not hardcode tool names.
+            # Discover what the MCP server actually exposes (don't trust hardcoded names).
+            discovered, tools_catalog = await discover_mcp_tools(mcp)
+            available = tool_names(discovered)
+
+            # Verify the workflow's required tools are advertised by the server.
+            missing_msg = require_tools(available, [
+                "classify_canonical_query",
+                "get_query_template",
+                "get_knowledge_for_query",
+            ])
+            if missing_msg:
+                return missing_msg
+
+            print("[0/4] Discovered MCP tools:", sorted(available))
 
             print("[1/4] Classifying support query...")
+            classify_result = await mcp.call_tool("classify_canonical_query", {
+                "user_query": user_query
+            })
             classification = unwrap(classify_result)
 
             if not isinstance(classification, dict):
                 return f"Classification error: Expected dict, got {type(classification)}"
 
+            suggested_category = classification.get("suggested_query")
             confidence = classification.get("confidence", 0)
 
             if not suggested_category:
@@ -143,6 +224,10 @@ async def handle_canonical_query_with_classification(user_query: str) -> str:
             print(f"[Result] Category: {suggested_category} (confidence: {confidence:.2f})")
 
             # Step 2: Get the prompt template for this category
+            print("[2/4] Getting support template...")
+            template_result = await mcp.call_tool("get_query_template", {
+                "query_name": suggested_category
+            })
             template_info = unwrap(template_result)
 
             if "error" in template_info:
@@ -152,6 +237,12 @@ async def handle_canonical_query_with_classification(user_query: str) -> str:
             description = template_info.get("description", "")
 
             # Step 3: Retrieve relevant knowledge
+            print(f"[3/4] Retrieving knowledge for {suggested_category}...")
+            knowledge_result = await mcp.call_tool("get_knowledge_for_query", {
+                "category": suggested_category,
+                "query": user_query,
+                "top_k": TOP_K
+            })
             knowledge_info = unwrap(knowledge_result)
 
             if "error" in knowledge_info:
@@ -167,10 +258,31 @@ async def handle_canonical_query_with_classification(user_query: str) -> str:
             print(f"[INFO] Retrieved {len(sources)} source(s)")
 
             # Step 4: Execute LLM with template + knowledge
+            print("[4/4] Generating response with LLM...")
+
+            # Format the prompt with knowledge
+            formatted_prompt = template.format(
+                query=user_query,
+                knowledge=knowledge
+            )
 
             try:
                 llm = ChatOllama(model=MODEL, temperature=0.3)
 
+                # Pass tool info to the LLM DYNAMICALLY from the MCP server.
+                # The catalog string is built from live `mcp.list_tools()` output,
+                # so the model knows exactly which MCP tools produced the context
+                # it is about to read – no hardcoded tool list.
+                system_msg = (
+                    "You are an OmniTech customer support specialist. "
+                    "Provide helpful, accurate, and friendly assistance based on the company "
+                    "documentation provided. Be concise but thorough. If the documentation "
+                    "doesn't contain the answer, politely suggest contacting support directly."
+                    "\n\n"
+                    f"{tools_catalog}\n\n"
+                    "The classification, template, and knowledge content in the user message "
+                    "were produced by the MCP tools listed above."
+                )
 
                 response = llm.invoke([
                     {"role": "system", "content": system_msg},
@@ -213,7 +325,20 @@ async def handle_rag_search(user_query: str) -> str:
     async with Client(MCP_ENDPOINT) as mcp:
         try:
             # Discover server tools at runtime (do not rely on hardcoded names).
+            discovered, tools_catalog = await discover_mcp_tools(mcp)
+            available = tool_names(discovered)
 
+            missing_msg = require_tools(available, ["vector_search_knowledge"])
+            if missing_msg:
+                return missing_msg
+
+            print(f"[RAG] Searching knowledge base for: '{user_query}'")
+
+            # Perform vector search across all documentation
+            search_result = await mcp.call_tool("vector_search_knowledge", {
+                "query": user_query,
+                "top_k": TOP_K * 2  # Get more results for exploratory queries
+            })
             search_data = unwrap(search_result)
 
             if "error" in search_data:
@@ -242,13 +367,31 @@ async def handle_rag_search(user_query: str) -> str:
             try:
                 llm = ChatOllama(model=MODEL, temperature=0.3)
 
+                # The tool catalog passed to the model is produced by calling
+                # mcp.list_tools() at the top of this function – so the LLM is
+                # informed about the server's advertised capabilities rather
+                # than from any hardcoded list.
                 system_msg = (
+                    "You are an OmniTech information assistant. "
+                    "Answer the user's question based on the provided documentation. "
+                    "Be informative and helpful. If the documentation doesn't fully answer "
+                    "the question, acknowledge what you found and suggest where they might "
+                    "find more information."
+                    "\n\n"
+                    f"{tools_catalog}\n\n"
+                    "The documentation excerpts in the user message were produced by the "
+                    "MCP tools listed above."
                 )
 
                 user_msg = (
+                    f"User Question: {user_query}\n\n"
+                    f"Relevant Documentation:\n{combined_knowledge}\n\n"
+                    "Please provide a helpful answer based on this documentation."
                 )
 
                 response = llm.invoke([
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg}
                 ])
 
                 result = response.content.strip()
@@ -281,6 +424,12 @@ async def process_query(user_query: str) -> str:
     Route queries to appropriate workflow based on intent.
     """
     # Determine if this is a support query or exploratory
+    if is_support_query(user_query):
+        print("[INFO] Detected customer support query - using classification workflow")
+        return await handle_canonical_query_with_classification(user_query)
+    else:
+        print("[INFO] Detected exploratory query - using RAG search")
+        return await handle_rag_search(user_query)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # 6. Command-line Interface                                          ║
